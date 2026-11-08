@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 PPA Add
+#
+# ppa-add — add or remove a Launchpad PPA without add-apt-repository and
+# without a working keyserver (dirmngr) connection.
+#
+# Usage: ppa-add [-r] [-n] <user/repo> [suite]
+#   -r, --remove     remove the PPA (sources file and signing key)
+#   -n, --no-update  skip the final apt-get update
+#
+# The signing key fingerprint is read from the PPA web page (Launchpad API
+# as a fallback), the key itself is fetched over plain HTTPS, and every
+# suite is validated against the PPA's InRelease files before anything is
+# written to the system.
+
+set -euo pipefail
+TMP=""
+trap 'rm -rf "${TMP:-}"' EXIT
+
+die() { echo "ppa-add: $*" >&2; exit 1; }
+
+MODE=add; DO_UPDATE=1
+while [[ "${1:-}" == -* ]]; do
+  case "$1" in
+    -r|--remove)    MODE=remove ;;
+    -n|--no-update) DO_UPDATE=0 ;;
+    --) shift; break ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+[[ $# -ge 1 && $# -le 2 && "$1" == */* ]] || die "usage: ppa-add [-r] [-n] user/repo [codename]"
+LP_USER="${1%%/*}"; LP_REPO="${1##*/}"
+
+maybe_update() {
+  if [[ "$DO_UPDATE" -eq 1 ]]; then
+    echo ">>> refreshing the package index"
+    sudo apt-get update
+  else
+    echo ">>> package index NOT refreshed; run 'sudo apt-get update' when you are done"
+  fi
+}
+
+remove() {
+  local removed=0 f
+  for f in /etc/apt/sources.list.d/${LP_USER}-${LP_REPO}-*.sources; do
+    [[ -e "$f" ]] || continue
+    sudo rm "$f" && echo ">>> removed $f" && removed=1
+  done
+  local key="/etc/apt/keyrings/${LP_USER}-${LP_REPO}.gpg"
+  if [[ -e "$key" ]]; then sudo rm "$key" && echo ">>> removed $key" && removed=1; fi
+  [[ $removed -eq 1 ]] || die "nothing found for ${LP_USER}/${LP_REPO}"
+  maybe_update
+}
+if [[ "$MODE" == remove ]]; then remove; exit 0; fi
+
+# Default suite: works on Ubuntu and its derivatives (Linux Mint, etc.)
+. /etc/os-release
+WANT="${2:-${DEBIAN_CODENAME:-${UBUNTU_CODENAME:-${VERSION_CODENAME:-$(lsb_release -cs)}}}}"
+
+# 1. One request for the PPA page: signing key fingerprint + suite list
+PPA_PAGE="$(curl -fsSL "https://launchpad.net/~${LP_USER}/+archive/ubuntu/${LP_REPO}")" \
+  || die "failed to open the PPA page (network error, or the PPA does not exist)"
+
+FPR="$(grep -o '[0-9A-F]\{40\}' <<<"$PPA_PAGE" | head -n1 || true)"
+if [[ -z "$FPR" ]]; then
+  echo ">>> fingerprint not found on the page, asking the API"
+  META="$(curl -fsSL "https://api.launchpad.net/1.0/~${LP_USER}/+archive/ubuntu/${LP_REPO}")" \
+    || die "failed to fetch PPA metadata"
+  FPR="$(sed -n 's/.*"signing_key_fingerprint": *"\([0-9A-F]\{40\}\)".*/\1/p' <<<"$META")"
+fi
+[[ -n "$FPR" ]] || die "failed to determine the PPA signing key"
+echo ">>> signing key: $FPR"
+
+DIST_BASE="https://ppa.launchpadcontent.net/${LP_USER}/${LP_REPO}/ubuntu"
+
+# 2. Suite candidates: <select id="field.series">, else <span id="series-deb">
+CANDIDATES=()
+mapfile -t CANDIDATES < <(
+  sed -n '/field\.series/,/<\/select>/p' <<<"$PPA_PAGE" \
+    | grep -o 'value="[a-z0-9]*"' | cut -d'"' -f2 \
+    | grep -v 'YOUR_UBUNTU_VERSION_HERE' | sort -u
+)
+if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+  mapfile -t CANDIDATES < <(
+    grep -o 'id="series-deb\(-src\)\{0,1\}">[a-z0-9]*' <<<"$PPA_PAGE" \
+      | cut -d'>' -f2 | sort -u
+  )
+fi
+
+# 3. Fallback: probe every Ubuntu series if the page could not be parsed
+if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+  echo ">>> no suite list found on the page, probing all Ubuntu series"
+  SERIES_JSON="$(curl -fsSL "https://api.launchpad.net/1.0/ubuntu/series")" \
+    || die "failed to fetch the Ubuntu series list"
+  mapfile -t CANDIDATES < <(grep -o '"name": *"[a-z0-9]*"' <<<"$SERIES_JSON" | cut -d'"' -f4)
+fi
+
+# 4. Validate candidates by HTTP status (real suites have an InRelease file)
+AVAIL=()
+for s in "${CANDIDATES[@]}"; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    "${DIST_BASE}/dists/${s}/InRelease")"
+  [[ "$code" == 200 ]] && AVAIL+=("$s")
+done
+[[ ${#AVAIL[@]} -gt 0 ]] || die "no releases found in this PPA"
+echo ">>> suites available: ${AVAIL[*]}"
+
+# 5. Validate the requested codename
+if [[ " ${AVAIL[*]} " != *" ${WANT} "* ]]; then
+  die "no release '${WANT}'. Available: ${AVAIL[*]}
+     (ppa-add ${LP_USER}/${LP_REPO} <one of them>)"
+fi
+echo ">>> using '${WANT}'"
+
+# 6. Fetch the key by its full fingerprint over HTTPS (bypasses dirmngr)
+TMP="$(mktemp -d)"
+curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" -o "$TMP/key.asc" \
+  || die "failed to download the signing key"
+grep -q 'BEGIN PGP' "$TMP/key.asc" || die "keyserver returned non-key data (HTML or an error page)"
+GOT="$(gpg --show-keys --with-colons "$TMP/key.asc" | awk -F: '$1=="fpr"{print $10; exit}')"
+[[ "${GOT^^}" == "$FPR" ]] || die "downloaded key fingerprint mismatch: $GOT"
+
+sudo mkdir -p /etc/apt/keyrings
+KEYRING="/etc/apt/keyrings/${LP_USER}-${LP_REPO}.gpg"
+sudo gpg --dearmor --yes -o "$KEYRING" "$TMP/key.asc"
+
+# 7. Write the deb822 sources file
+SRC="/etc/apt/sources.list.d/${LP_USER}-${LP_REPO}-${WANT}.sources"
+sudo tee "$SRC" >/dev/null <<EOF
+Types: deb
+URIs: ${DIST_BASE}
+Suites: ${WANT}
+Components: main
+Signed-By: ${KEYRING}
+EOF
+echo ">>> $SRC written"
+
+maybe_update
